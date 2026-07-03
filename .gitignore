@@ -1,0 +1,56 @@
+# Secrets and credentials — never commit these
+.env
+.env.*
+*.env
+credentials.json
+secrets.json
+*_credentials.*
+*_secrets.*
+aws_credentials
+.aws/credentials
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Logs and local data (use S3/DynamoDB in prod)
+*.log
+logs/
+trade_log*.csv
+backtest_results*.csv
+
+# Lambda deployment artifacts
+*.zip
+deployment_package/
+layer/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Coverage
+.coverage
+htmlcov/
+.pytest_cache/
