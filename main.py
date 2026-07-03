@@ -1,7 +1,7 @@
 """
 Main bot loop — one trading cycle per invocation ("check-then-act").
 
-Run this on a schedule (systemd timer / cron on an always-on instance, or a
+Run this on a schedule (systemd timer on the Lightsail box in deploy/, or a
 Lambda handler wrapping run_cycle() later if the Robinhood auth story ends up
 supporting headless clients). The scheduling mechanism is intentionally
 decoupled from this file — main() just does one cycle and exits.
@@ -14,12 +14,18 @@ Cycle steps:
   5. DRY_RUN: log what would happen via review_equity_order (no real order)
      Live:    place_equity_order, then notify
   6. Log the decision (durable), notify on trades/errors/halts
+
+IMPORTANT — market vs. limit orders: Robinhood only allows fractional
+shares on type="market" orders. SPY trades around $745/share; a $100
+account capped at 50% per position ($50 max) can never buy a whole share,
+so BUY orders here are dollar-based market orders, not limit orders. This
+is a deliberate deviation from the original "always use limit orders"
+preference — see robinhood_client.py's docstring for the full reasoning.
 """
 import asyncio
-import os
-import sys
 import traceback
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
@@ -73,7 +79,8 @@ async def run_cycle() -> None:
 
     # ── 1. Account snapshot + risk pre-check ────────────────────────────
     try:
-        portfolio = await rh.get_portfolio()
+        account_number = await rh.get_agentic_account_number()
+        portfolio = await rh.get_portfolio(account_number)
         account_value = _extract_account_value(portfolio)
     except Exception as e:
         notify("Trading bot ERROR", f"Failed to fetch portfolio: {e!r}\n{traceback.format_exc()}")
@@ -107,7 +114,7 @@ async def run_cycle() -> None:
         notify("Trading bot ERROR", f"Failed to compute signal: {e!r}\n{traceback.format_exc()}")
         return
 
-    positions = await rh.get_equity_positions()
+    positions = await rh.get_equity_positions(account_number)
     current_shares = _extract_shares(positions, symbol)
     in_position = current_shares > 0
     signal_col = "z_score" if "z_score" in signals.columns else "fast_ma"
@@ -115,18 +122,19 @@ async def run_cycle() -> None:
 
     action = "HOLD"
     quantity = 0.0
+    order_dollars = 0.0
     price = float(latest["price"])
     reason = latest.get("description", "")
 
     if latest["signal"] == 1 and not in_position:
-        order_dollars = account_value * config.MAX_POSITION_PCT
+        order_dollars = round(account_value * config.MAX_POSITION_PCT, 2)
         check = risk.check_order(order_dollars, account_value)
         if not check.allowed:
             action = "SKIPPED"
             reason = check.reason
         else:
             action = "BUY"
-            quantity = round(order_dollars / price, 6)
+            quantity = round(order_dollars / price, 6)  # estimate; market order fills at real-time price
     elif latest["signal"] == 0 and in_position:
         action = "SELL"
         quantity = current_shares
@@ -137,14 +145,32 @@ async def run_cycle() -> None:
         side = "buy" if action == "BUY" else "sell"
         try:
             if config.DRY_RUN:
-                review = await rh.review_equity_order(symbol, side, quantity, order_type="limit", limit_price=price)
-                reason = f"DRY RUN — would {action} {quantity} {symbol} @ ~${price:.2f}. Review: {review}"
+                if action == "BUY":
+                    review = await rh.review_equity_order(
+                        account_number, symbol, side, "market", dollar_amount=f"{order_dollars:.2f}"
+                    )
+                else:
+                    review = await rh.review_equity_order(
+                        account_number, symbol, side, "market", quantity=f"{quantity:.6f}"
+                    )
+                reason = f"DRY RUN — would {action} ~{quantity} {symbol} @ ~${price:.2f}. Review: {review}"
             else:
-                result = await rh.place_equity_order(symbol, side, quantity, order_type="limit", limit_price=price)
-                order_id = getattr(result, "order_id", None) or str(result)
+                ref_id = str(uuid.uuid4())
+                if action == "BUY":
+                    result = await rh.place_equity_order(
+                        account_number, symbol, side, "market",
+                        dollar_amount=f"{order_dollars:.2f}", ref_id=ref_id,
+                    )
+                else:
+                    result = await rh.place_equity_order(
+                        account_number, symbol, side, "market",
+                        quantity=f"{quantity:.6f}", ref_id=ref_id,
+                    )
+                order_id = result.get("data", {}).get("id") or ref_id
                 notify(
                     f"Trading bot: LIVE {action} placed",
-                    f"{quantity} {symbol} @ ~${price:.2f}. Order: {order_id}",
+                    f"~{quantity} {symbol} (~${order_dollars or quantity * price:.2f}) @ ~${price:.2f}. "
+                    f"Order: {order_id}",
                 )
         except Exception as e:
             notify("Trading bot ERROR", f"Order execution failed: {e!r}\n{traceback.format_exc()}")
@@ -173,34 +199,54 @@ async def run_cycle() -> None:
 
 async def _fetch_price_history(rh: RobinhoodClient, symbol: str) -> pd.Series:
     """Pulls enough daily history for the active strategy's rolling window."""
-    lookback = max(config.TF_SLOW_WINDOW, config.MR_WINDOW) + 5
-    result = await rh.get_equity_historicals(symbol, lookback_days=lookback)
-    return _parse_historicals(result)
+    lookback_days = max(config.TF_SLOW_WINDOW, config.MR_WINDOW) * 2 + 10  # buffer for weekends/holidays
+    start_time = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime("%Y-%m-%dT00:00:00Z")
+    result = await rh.get_equity_historicals([symbol], start_time=start_time, interval="day")
+    return _parse_historicals(result, symbol)
 
 
-def _parse_historicals(result) -> pd.Series:
+def _parse_historicals(result: dict, symbol: str) -> pd.Series:
     """
-    UNVERIFIED — placeholder parser. Robinhood's real get_equity_historicals
-    response shape hasn't been seen yet (needs a live connection). Once you
-    have one, call it once, print the raw result, and rewrite this function
-    to match. Expected shape based on the tool description ("OHLCV price
-    bars across a time range") is a list of bars with a close price and a
-    timestamp — adjust the field names below once confirmed.
+    Verified live against a real get_equity_historicals call. Shape:
+    {"data": {"results": [{"symbol": "SPY", "bars": [
+        {"begins_at": "2026-07-02T00:00:00Z", "close_price": "744.780000", ...}, ...
+    ]}]}}
     """
-    raise NotImplementedError(
-        "Update _parse_historicals() to match the real get_equity_historicals "
-        "response once you have a live Robinhood MCP connection to inspect it."
-    )
+    data = result.get("data", result)
+    results = data.get("results", [])
+    match = next((r for r in results if r.get("symbol") == symbol), None)
+    if not match or not match.get("bars"):
+        raise ValueError(f"No historical bars returned for {symbol}: {result!r}")
+    bars = match["bars"]
+    dates = pd.DatetimeIndex([pd.Timestamp(b["begins_at"]) for b in bars])
+    closes = [float(b["close_price"]) for b in bars]
+    return pd.Series(closes, index=dates, name="Close")
 
 
-def _extract_account_value(portfolio) -> float:
-    """Robinhood's get_portfolio response shape needs to be confirmed against
-    a real connection — adjust this parser once you can see real output."""
-    raise NotImplementedError("Parse the real get_portfolio() response shape once connected.")
+def _extract_account_value(portfolio: dict) -> float:
+    """
+    Verified live against a real get_portfolio call. Shape:
+    {"data": {"total_value": "100", "cash": "100",
+               "buying_power": {"buying_power": "100.0000", ...}, ...}}
+    """
+    data = portfolio.get("data", portfolio)
+    return float(data["total_value"])
 
 
-def _extract_shares(positions, symbol: str) -> float:
-    raise NotImplementedError("Parse the real get_equity_positions() response shape once connected.")
+def _extract_shares(positions: dict, symbol: str) -> float:
+    """
+    Verified live against a real get_equity_positions call. Shape:
+    {"data": {"positions": [
+        {"symbol": "SPY", "quantity": "0.134", "shares_available_for_sells": "0.134", ...}
+    ]}}
+    Empty positions list is a valid, common response (verified: fresh
+    accounts return {"data": {"positions": []}}).
+    """
+    data = positions.get("data", positions)
+    for p in data.get("positions", []):
+        if p.get("symbol") == symbol:
+            return float(p.get("quantity", 0))
+    return 0.0
 
 
 def main():

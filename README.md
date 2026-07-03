@@ -12,24 +12,34 @@ real orders) until you explicitly flip it live.
 | Backtest engine + both strategies | Done, unit-tested (17 tests). Real-data run needs to happen on a machine with internet access (see below) |
 | Risk guardrails (`risk.py`) | Done, unit-tested (17 tests) |
 | Decision logging (`decision_log.py`) | Done, unit-tested (4 tests) — DynamoDB with local CSV fallback |
-| Robinhood MCP client (`robinhood_client.py`) | Interface built, safety-tested (6 tests) — **auth unverified, blocked on Robinhood account access** |
-| Main bot loop (`main.py`) | Built — two parsing functions are placeholders until there's a real Robinhood connection to inspect real response shapes against |
+| Robinhood account access | **Confirmed live** — dedicated Agentic account `923108740`, funded with $100, zero open positions |
+| Robinhood MCP client (`robinhood_client.py`) | Built and verified against real live calls (get_accounts, get_portfolio, get_equity_quotes, get_equity_positions, get_equity_historicals) — 9 tests. **Unattended/AWS auth still unresolved** (see below) |
+| Main bot loop (`main.py`) | Built, parsers verified against real captured response shapes — 8 tests |
 | AWS deployment | Documented (`deploy/`) — Lightsail always-on instance, not Lambda (see why below) |
 
-**44/44 unit tests pass.** Run them yourself: `python -m pytest tests/ -v`
+**55/55 unit tests pass.** Run them yourself: `python -m pytest tests/ -v`
 
-## What's blocking full live wiring
+## What's actually confirmed vs. still open
 
-1. **You don't have Robinhood Agentic Trading access yet.** It's rolling
-   out gradually — Robinhood emails you when it's available, and you need a
-   primary Robinhood account in good standing first. Nothing below can be
-   tested end-to-end until that access arrives.
-2. **The auth flow for a headless bot isn't documented by Robinhood.**
-   Their docs only cover connecting through a live AI app session (Claude
-   Code, Claude Desktop, ChatGPT, Codex, Cursor, Grok). `robinhood_client.py`
-   has the MCP call plumbing built and ready, but getting a long-lived
-   access token into it needs to be worked out once you have account access
-   — see the big comment at the top of that file for the two realistic paths.
+Confirmed live, via an interactive Cowork session's own Robinhood connection:
+- You have Agentic Trading access and a funded ($100), empty Agentic account.
+- The real response shapes for account/portfolio/position/quote/historical
+  data — `main.py`'s parsers are built against real data, not guesses.
+- A real trade-off the docs didn't make obvious: Robinhood only allows
+  **fractional shares on market orders**, never limit orders. SPY trades
+  around $745/share, so a $50 position is inherently fractional — meaning
+  BUY orders here have to be dollar-based market orders, not limit orders.
+  That's a deliberate deviation from the original "always use limit orders"
+  preference; see `robinhood_client.py`'s docstring for the full reasoning.
+
+Still open:
+- **Unattended auth.** The live check above went through an interactive
+  session's own connected-apps login — it did not hand this script a
+  portable, storable bearer token. Robinhood's docs only document
+  connecting through a live AI app session (Claude Code, Claude Desktop,
+  ChatGPT, Codex, Cursor, Grok). How a standalone AWS box authenticates
+  without one of those open is still unresolved — see the TODO in
+  `robinhood_client.py`'s `_load_token()`.
 
 ## Running the backtest with real data
 
@@ -56,21 +66,19 @@ decision_log.py        Durable per-cycle logging (DynamoDB + CSV fallback)
 robinhood_client.py     MCP client wrapper for the Robinhood Trading MCP
 main.py                 Ties it all together into one trading cycle
 deploy/                 AWS Lightsail setup (systemd timer, DynamoDB tables, SNS)
-tests/                  44 unit tests, no AWS/network required
+tests/                  55 unit tests, no AWS/network required
 ```
 
 ## Next steps, in order
 
 1. Run the real-data backtest above and sanity-check the numbers.
-2. Wait for / check for Robinhood Agentic Trading access.
-3. Once you have access: complete the one-time OAuth login through Claude
-   Desktop or Claude Code, and work out how to get a reusable access token
-   into `ROBINHOOD_ACCESS_TOKEN` (see `robinhood_client.py`'s docstring).
-4. Fix the two placeholder parsers in `main.py` (`_parse_historicals`,
-   `_extract_account_value`, `_extract_shares`) against the real response
-   shapes you'll see once connected.
-5. Run `main.py` locally with `DRY_RUN=true` and watch it log real dry-run
+2. Work out unattended auth (the one open item above) — likely means
+   digging into whether Claude Desktop's Robinhood connector exposes a
+   reusable token, or checking Robinhood's docs periodically as the
+   product matures out of beta.
+3. Once you have a token: run `main.py` locally with `DRY_RUN=true` (set
+   `ROBINHOOD_ACCESS_TOKEN` in your shell) and watch it log real dry-run
    decisions for a few days.
-6. Only then: follow `deploy/README.md` to put it on AWS.
-7. Only after that's been running clean in dry-run for a while: flip
+4. Only then: follow `deploy/README.md` to put it on AWS.
+5. Only after that's been running clean in dry-run for a while: flip
    `DRY_RUN=false` yourself, deliberately — never automated.

@@ -2,49 +2,37 @@
 Robinhood Trading MCP client — wraps calls to Robinhood's OFFICIAL Agentic
 Trading MCP server (https://agent.robinhood.com/mcp/trading).
 
-╔══════════════════════════════════════════════════════════════════════════╗
-║  STATUS: interface complete, AUTH UNVERIFIED. Do not treat this as        ║
-║  working until you've confirmed the auth flow yourself — see the big      ║
-║  comment block below "WHY THIS IS UNVERIFIED".                            ║
-╚══════════════════════════════════════════════════════════════════════════╝
+STATUS as of the last live check: account access CONFIRMED. A dedicated
+Agentic account exists (agentic_allowed=true, cash type, funded with $100,
+zero open positions) and read tools (get_accounts, get_portfolio,
+get_equity_quotes, get_equity_positions, get_equity_historicals) were called
+live and returned real data — the response-shape parsing in main.py is
+built against that real data, not guesses.
 
-WHY THIS IS UNVERIFIED
------------------------
-As of writing, Robinhood's own docs only document connecting the Trading MCP
-through a named list of interactive AI platforms — Claude Code, Claude
-Desktop, ChatGPT, Codex, Cursor, Grok — each of which drives its own OAuth
-login popup and stores the resulting session itself. Robinhood has not
-published a spec for registering an arbitrary third-party headless client
-(client_id, redirect URI, token endpoint, refresh-token grant, etc.).
+WHAT'S STILL UNVERIFIED: running this UNATTENDED (e.g. on the AWS Lightsail
+box in deploy/) still needs its own access token. The live check above went
+through an interactive Cowork session's own connected-apps auth — that
+doesn't hand this script a portable bearer token to store in Secrets
+Manager. Robinhood's docs only document connecting through a live AI app
+session (Claude Code, Claude Desktop, ChatGPT, Codex, Cursor, Grok), so how
+a standalone always-on server authenticates is still the open question. See
+the module-level TODO in _load_token().
 
-That means the *transport* below (MCP over streamable HTTP, bearer token
-auth) is standard and should work once you have a valid access token — but
-HOW you legally/reliably obtain and refresh that token outside one of the
-named platforms is not documented. Two realistic options once you have
-account access:
-
-  1. Complete the one-time login through Claude Desktop or Claude Code
-     (whichever you have open), then inspect whether the resulting session
-     can be reused by this script (e.g. Claude Desktop's MCP connector may
-     store a token you can reference, or the OAuth callback may hand back a
-     bearer token you can capture once and store in Secrets Manager).
-  2. Contact Robinhood support / check for updated developer docs — this
-     product is described as "currently rolling out," so the third-party
-     headless story may become clearer as it matures out of beta.
-
-Do NOT wire this into a scheduled AWS job until step 1 or 2 above has
-actually produced a working, refreshable token in your hands. Wishful
-placeholder credentials will just fail loudly (which is the safe outcome —
-better than silently not trading, or worse, crashing mid-cycle).
-
-WHAT IS SAFE REGARDLESS
-------------------------
-Every method below respects config.DRY_RUN. In dry-run mode this client
-NEVER calls place_equity_order — it only ever reads data and (for orders)
-calls review_equity_order, which Robinhood's docs describe as a pre-trade
-simulation that does not place a real order. So even once auth is wired up,
-running with DRY_RUN=true (the default) cannot move real money.
+IMPORTANT DESIGN TRADE-OFF DISCOVERED FROM THE REAL TOOL SCHEMA
+------------------------------------------------------------------
+Robinhood's place_equity_order / review_equity_order docs state fractional
+shares are only allowed on type="market" orders during regular market hours
+— never on limit orders. SPY trades around $745/share; with MAX_CAPITAL=100
+and MAX_POSITION_PCT=0.5, a single position is capped at $50 — nowhere near
+one whole share. That means BUY orders on SPY must be dollar-based market
+orders (fractional), not limit orders, or the bot literally cannot buy
+anything with this budget. This directly conflicts with the original
+brief's "use limit orders, not blind market orders" preference. This file
+implements market orders for fractional buys and documents the risk
+(no price-protection on fills) rather than silently picking a side —
+flag this to the user before going live.
 """
+import json
 import os
 import sys
 from typing import Any, Optional
@@ -61,7 +49,7 @@ class RobinhoodAuthError(RuntimeError):
 class RobinhoodClient:
     def __init__(self, access_token: Optional[str] = None):
         self.access_token = access_token or self._load_token()
-        self._session = None  # lazily-created MCP ClientSession
+        self._agentic_account_number: Optional[str] = None
 
         if not config.DRY_RUN:
             print(
@@ -81,6 +69,14 @@ class RobinhoodClient:
           2. AWS Secrets Manager secret named by ROBINHOOD_TOKEN_SECRET_NAME
         Returns None if neither is set — callers should fail loudly rather
         than silently proceeding without auth.
+
+        TODO once you're ready to deploy unattended: this is still the
+        unresolved piece. Realistic paths to an actual token: check whether
+        Claude Desktop's Robinhood connector exposes the underlying bearer
+        token anywhere inspectable, or watch for Robinhood publishing a
+        headless/service-account auth flow as the product matures out of
+        beta. Don't guess — an invalid token fails loudly, which is safe;
+        a *silently wrong* one is the failure mode to avoid.
         """
         env_token = os.environ.get("ROBINHOOD_ACCESS_TOKEN")
         if env_token:
@@ -103,17 +99,16 @@ class RobinhoodClient:
             raise RobinhoodAuthError(
                 "No Robinhood access token configured. Set ROBINHOOD_ACCESS_TOKEN "
                 "(dev) or ROBINHOOD_TOKEN_SECRET_NAME (prod, via Secrets Manager). "
-                "See the module docstring — the auth flow needs to be verified "
-                "manually before this will work."
+                "See the module docstring — unattended auth is still unresolved."
             )
         return self.access_token
 
     # ── MCP call plumbing ───────────────────────────────────────────────
-    async def _call_tool(self, name: str, arguments: dict) -> Any:
+    async def _call_tool(self, name: str, arguments: dict) -> dict:
         """
-        Calls a tool on the Robinhood Trading MCP over streamable HTTP,
-        using the loaded bearer token. Requires the `mcp` package
-        (see requirements.txt).
+        Calls a tool on the Robinhood Trading MCP over streamable HTTP and
+        returns the parsed JSON payload (a plain dict), matching the shape
+        you'd see calling the same tool interactively.
         """
         token = self._require_token()
         from mcp import ClientSession
@@ -124,44 +119,84 @@ class RobinhoodClient:
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 result = await session.call_tool(name, arguments)
-                return result
+                if result.content and hasattr(result.content[0], "text"):
+                    return json.loads(result.content[0].text)
+                return result  # unexpected shape — let callers see the raw object
 
-    # ── Read-only tools (safe in any mode) ─────────────────────────────
-    async def get_accounts(self) -> Any:
+    # ── Account helpers ──────────────────────────────────────────────────
+    async def get_accounts(self) -> dict:
         return await self._call_tool("get_accounts", {})
 
-    async def get_portfolio(self) -> Any:
-        return await self._call_tool("get_portfolio", {})
+    async def get_agentic_account_number(self) -> str:
+        """Finds and caches the account_number of the agentic_allowed=true
+        account — the only one this bot is permitted to trade in."""
+        if self._agentic_account_number:
+            return self._agentic_account_number
+        accounts = await self.get_accounts()
+        for acct in accounts.get("data", {}).get("accounts", []):
+            if acct.get("agentic_allowed"):
+                self._agentic_account_number = acct["account_number"]
+                return self._agentic_account_number
+        raise RuntimeError(
+            "No agentic_allowed=true account found. Open/confirm your Robinhood "
+            "Agentic account before running the bot."
+        )
 
-    async def get_equity_quotes(self, symbols: list[str]) -> Any:
+    # ── Read-only tools (safe in any mode) ─────────────────────────────
+    async def get_portfolio(self, account_number: str) -> dict:
+        return await self._call_tool("get_portfolio", {"account_number": account_number})
+
+    async def get_equity_quotes(self, symbols: list[str]) -> dict:
         return await self._call_tool("get_equity_quotes", {"symbols": symbols})
 
-    async def get_equity_positions(self) -> Any:
-        return await self._call_tool("get_equity_positions", {})
+    async def get_equity_positions(self, account_number: str) -> dict:
+        return await self._call_tool("get_equity_positions", {"account_number": account_number})
 
-    async def get_equity_tradability(self, symbol: str) -> Any:
-        return await self._call_tool("get_equity_tradability", {"symbol": symbol})
-
-    async def get_equity_historicals(self, symbol: str, lookback_days: int) -> Any:
+    async def get_equity_tradability(self, account_number: str, symbols: list[str]) -> dict:
         return await self._call_tool(
-            "get_equity_historicals", {"symbol": symbol, "lookback_days": lookback_days}
+            "get_equity_tradability", {"account_number": account_number, "symbols": symbols}
+        )
+
+    async def get_equity_historicals(self, symbols: list[str], start_time: str, interval: str = "day") -> dict:
+        return await self._call_tool(
+            "get_equity_historicals",
+            {"symbols": symbols, "start_time": start_time, "interval": interval},
         )
 
     # ── Order tools — DRY_RUN gated ─────────────────────────────────────
     async def review_equity_order(
-        self, symbol: str, side: str, quantity: float, order_type: str, limit_price: Optional[float] = None
-    ) -> Any:
-        """Simulates an order and returns pre-trade warnings. Always safe
-        to call — Robinhood describes this tool as a simulation, not a
-        real order — used in dry-run mode to show what WOULD happen."""
-        args = {"symbol": symbol, "side": side, "quantity": quantity, "order_type": order_type}
+        self,
+        account_number: str,
+        symbol: str,
+        side: str,
+        order_type: str,
+        quantity: Optional[str] = None,
+        dollar_amount: Optional[str] = None,
+        limit_price: Optional[str] = None,
+    ) -> dict:
+        """Simulates an order (Robinhood confirms this doesn't place a real
+        order) — always safe to call, used in dry-run mode to show what
+        WOULD happen. Provide exactly one of quantity or dollar_amount."""
+        args = {"account_number": account_number, "symbol": symbol, "side": side, "type": order_type}
+        if quantity is not None:
+            args["quantity"] = quantity
+        if dollar_amount is not None:
+            args["dollar_amount"] = dollar_amount
         if limit_price is not None:
             args["limit_price"] = limit_price
         return await self._call_tool("review_equity_order", args)
 
     async def place_equity_order(
-        self, symbol: str, side: str, quantity: float, order_type: str = "limit", limit_price: Optional[float] = None
-    ) -> Any:
+        self,
+        account_number: str,
+        symbol: str,
+        side: str,
+        order_type: str,
+        quantity: Optional[str] = None,
+        dollar_amount: Optional[str] = None,
+        limit_price: Optional[str] = None,
+        ref_id: Optional[str] = None,
+    ) -> dict:
         """
         Places a REAL order. Hard-blocked unless config.DRY_RUN is False —
         this is the one function in the whole codebase that can move money,
@@ -173,10 +208,18 @@ class RobinhoodClient:
                 "This should never happen; the bot's main loop should only call "
                 "review_equity_order() in dry-run mode. This is a bug if you see it."
             )
-        args = {"symbol": symbol, "side": side, "quantity": quantity, "order_type": order_type}
+        args = {"account_number": account_number, "symbol": symbol, "side": side, "type": order_type}
+        if quantity is not None:
+            args["quantity"] = quantity
+        if dollar_amount is not None:
+            args["dollar_amount"] = dollar_amount
         if limit_price is not None:
             args["limit_price"] = limit_price
+        if ref_id is not None:
+            args["ref_id"] = ref_id
         return await self._call_tool("place_equity_order", args)
 
-    async def cancel_equity_order(self, order_id: str) -> Any:
-        return await self._call_tool("cancel_equity_order", {"order_id": order_id})
+    async def cancel_equity_order(self, account_number: str, order_id: str) -> dict:
+        return await self._call_tool(
+            "cancel_equity_order", {"account_number": account_number, "order_id": order_id}
+        )

@@ -58,7 +58,15 @@ class TestDryRunGuard(unittest.TestCase):
         config.DRY_RUN = True
         client = RobinhoodClient()
         with self.assertRaises(RuntimeError) as ctx:
-            asyncio.run(client.place_equity_order("SPY", "buy", 1, "limit", 430.0))
+            asyncio.run(
+                client.place_equity_order(
+                    account_number="923108740",
+                    symbol="SPY",
+                    side="buy",
+                    order_type="market",
+                    dollar_amount="50.00",
+                )
+            )
         self.assertIn("DRY_RUN", str(ctx.exception))
 
     def test_place_order_not_blocked_purely_by_dry_run_when_false(self):
@@ -69,8 +77,70 @@ class TestDryRunGuard(unittest.TestCase):
         config.DRY_RUN = False
         client = RobinhoodClient()
         with self.assertRaises(Exception) as ctx:
-            asyncio.run(client.place_equity_order("SPY", "buy", 1, "limit", 430.0))
+            asyncio.run(
+                client.place_equity_order(
+                    account_number="923108740",
+                    symbol="SPY",
+                    side="buy",
+                    order_type="market",
+                    dollar_amount="50.00",
+                )
+            )
         self.assertNotIn("DRY_RUN is True", str(ctx.exception))
+
+
+class TestAgenticAccountLookup(unittest.TestCase):
+    """Uses real fixture data captured from a live get_accounts call
+    (account numbers are the actual ones from the connected account)."""
+
+    REAL_ACCOUNTS_RESPONSE = {
+        "data": {
+            "accounts": [
+                {"account_number": "754810547", "type": "margin", "agentic_allowed": False, "is_default": True},
+                {"account_number": "923108740", "type": "cash", "nickname": "Agentic", "agentic_allowed": True, "is_default": False},
+            ]
+        }
+    }
+
+    def setUp(self):
+        os.environ["ROBINHOOD_ACCESS_TOKEN"] = "test-token"
+
+    def tearDown(self):
+        os.environ.pop("ROBINHOOD_ACCESS_TOKEN", None)
+
+    def test_finds_agentic_allowed_account(self):
+        client = RobinhoodClient()
+
+        async def fake_get_accounts():
+            return self.REAL_ACCOUNTS_RESPONSE
+
+        client.get_accounts = fake_get_accounts
+        account_number = asyncio.run(client.get_agentic_account_number())
+        self.assertEqual(account_number, "923108740")
+
+    def test_caches_result_after_first_call(self):
+        client = RobinhoodClient()
+        call_count = 0
+
+        async def fake_get_accounts():
+            nonlocal call_count
+            call_count += 1
+            return self.REAL_ACCOUNTS_RESPONSE
+
+        client.get_accounts = fake_get_accounts
+        asyncio.run(client.get_agentic_account_number())
+        asyncio.run(client.get_agentic_account_number())
+        self.assertEqual(call_count, 1)
+
+    def test_raises_if_no_agentic_account(self):
+        client = RobinhoodClient()
+
+        async def fake_get_accounts():
+            return {"data": {"accounts": [{"account_number": "1", "agentic_allowed": False}]}}
+
+        client.get_accounts = fake_get_accounts
+        with self.assertRaises(RuntimeError):
+            asyncio.run(client.get_agentic_account_number())
 
 
 if __name__ == "__main__":
