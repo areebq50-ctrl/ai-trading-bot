@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the trading bot every RUN_INTERVAL_MINUTES during market hours
+
+[Timer]
+# Runs every 60 min, 13:30-20:00 UTC (9:30am-4:00pm ET), Mon-Fri.
+# Adjust the hour range for ET/EDT daylight saving twice a year, or switch
+# to a UTC-aware scheduler if this bot ever needs to survive that unattended.
+OnCalendar=Mon..Fri 13,14,15,16,17,18,19:30
+Persistent=false
+
+[Install]
+WantedBy=timers.target

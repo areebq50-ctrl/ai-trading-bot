@@ -1,0 +1,17 @@
+[Unit]
+Description=AI trading bot — single cycle runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=tradingbot
+WorkingDirectory=/opt/ai-trading-bot
+EnvironmentFile=/opt/ai-trading-bot/.env
+ExecStart=/opt/ai-trading-bot/venv/bin/python3 /opt/ai-trading-bot/main.py
+
+# Hardening — the bot doesn't need broad system access
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/ai-trading-bot
